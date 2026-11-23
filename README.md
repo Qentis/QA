@@ -1,11 +1,32 @@
-<div align="center">
+# QA BugSnap
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Мобильный инструмент QA-инженера для создания баг-репортов по скриншотам с помощью Gemini AI и отправки задач в таск-трекер (Mira / Bitmetrix).
 
-  <h1>Built with AI Studio</h2>
+## Локальный запуск одной командой
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+### Вариант 1: Node.js (macOS / Linux / Windows)
+Требуется **Node.js 20+**.
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+```bash
+npm run local
+```
 
-</div>
+Или используйте скрипт для вашей ОС:
+- **macOS / Linux:** `./start.sh`
+- **Windows:** `start.bat` (можно просто запустить двойным кликом)
+
+Скрипт автоматически:
+1. Установит зависимости (`npm install`), если их ещё нет.
+2. Создаст `.env` из `.env.example` и попросит вставить `GEMINI_API_KEY` (при первом запуске).
+3. Запустит приложение на `http://localhost:3000` и покажет адрес в локальной сети (например `http://192.168.1.42:3000`), чтобы его можно было сразу открыть на смартфоне Android в той же Wi-Fi сети.
+
+Вы также можете передать ключ прямо в команде:
+```bash
+GEMINI_API_KEY="ваш_ключ" npm run local
+```
+
+### Вариант 2: Docker (одна команда)
+```bash
+GEMINI_API_KEY="ваш_ключ" docker compose up --build
+```
+*(или добавьте `GEMINI_API_KEY` в `.env` и выполните `docker compose up --build`)*

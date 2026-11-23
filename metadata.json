@@ -1,0 +1,6 @@
+{
+  "name": "QA BugSnap",
+  "description": "Мобильный инструмент QA-инженера для создания баг-репортов и задач по скриншотам с помощью Gemini AI и отправки в таск-трекер.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

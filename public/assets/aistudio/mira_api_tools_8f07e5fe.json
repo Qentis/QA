@@ -1,0 +1,823 @@
+[
+  {
+    "name": "mira_task_list",
+    "description": "List tasks visible to the key owner in Mira (HR platform). Returns short rows (id, url, title, state, priority, dates, board, stage, assignee, author, tags, checklist counts, updated_at) newest-updated first, plus `truncated`. No descriptions or comments: use mira_task_get for those. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["open", "done", "canceled", "all"],
+          "description": "Which tasks: open (new, active, review), done, canceled, or all. Default: open."
+        },
+        "mine": {
+          "type": "boolean",
+          "description": "true: only tasks where the user is assignee or co-assignee. Default: all visible tasks."
+        },
+        "board_id": {
+          "type": "integer",
+          "description": "Only tasks of this board."
+        },
+        "updated_since": {
+          "type": "string",
+          "description": "UTC moment YYYY-MM-DDTHH:MM:SSZ; only tasks changed at or after it."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "description": "Max rows. Default 200. If `truncated` is true, narrow the filter or use updated_since."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_get",
+    "description": "Get one Mira task in full: fields, description (Markdown), checklist, subtasks, attachments, and the comment feed with system events. Checklist item ids in `checklist_items` are what mira_task_checklist takes. If the user gave a link to a Mira task, pass it in `url` as is. Otherwise pass `task_id`. Provide exactly one of the two. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "description": "Task number."
+        },
+        "url": {
+          "type": "string",
+          "description": "Task link exactly as the user gave it, e.g. https://host/tasks/Abcd_Q/42."
+        },
+        "comments_limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Max root comments, default 50."
+        },
+        "comments_before_id": {
+          "type": "integer",
+          "description": "Cursor: return comments older than this id (use the smallest id of the previous answer when comments_truncated is true)."
+        }
+      },
+      "oneOf": [
+        { "required": ["task_id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["task_id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_delete",
+    "description": "Permanently delete a Mira task and all its subtasks, including comments, checklist items and attachments. Needs a key with changes allowed. Only the task author or the owner (OWNER level) of its board or project can delete it; board WRITE access alone is insufficient. Archived boards refuse deletion with board_archived. Pass exactly one of task_id and url. Returns id and deleted, the number of removed tasks including subtasks. A repeated call returns task_not_found, as do missing, foreign and invisible tasks. Refusal rate_limited means wait retry_after seconds; if it is over an hour, stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": { "type": "integer", "minimum": 1, "description": "Task number." },
+        "url": { "type": "string", "description": "Task link exactly as the user gave it." }
+      },
+      "oneOf": [
+        { "required": ["task_id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["task_id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_move",
+    "description": "Move a Mira task to a column (stage) of its board, like dragging the card on the board. Columns and their ids are in `board.stages` of mira_task_get; the current column is `stage`. Every column has a status `ecat` (1 To do, 2 In progress, 3 Under review, 4 Done), and a move is the action for the target column status: to-do sets `new`, in-progress sets `active`, under-review sends the task to review (assignee or helper, when the board has review on), done finishes it for the author or sends it to review for others when the board has review on. Moving out of done reopens the task (author, assignee or helper); moving out of review into a working column returns it (author) or withdraws it (assignee or helper). Notifications are the same as for the status buttons. Repeating the same move is safe: `changed` is false. Returns the task row and `changed`. Needs a key with changes allowed. Finishing or sending to review a task with a required checklist is refused: `checklist_incomplete` when items are unchecked, `checklist_empty` when it has no items; tell the user to fix the checklist in Mira. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "description": "Task number."
+        },
+        "url": {
+          "type": "string",
+          "description": "Task link exactly as the user gave it, e.g. https://host/tasks/Abcd_Q/42."
+        },
+        "stage_id": {
+          "type": "integer",
+          "description": "Target column id from board.stages of the task (mira_task_get)."
+        }
+      },
+      "required": ["stage_id"],
+      "oneOf": [
+        { "required": ["task_id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["task_id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_move_board",
+    "description": "Move a root task and all descendants to another board in the same company. Preserves task ids, hierarchy, participants, comments, attachments and checklist. Requires author or source board WRITE and target board WRITE. Get target board_id and stage_id from mira_board_list. Optional stage_id applies to the root; descendants use columns matching their states. Missing review/done column causes an atomic refusal transition_invalid. A subtask cannot move independently: bad_request. Same board is a safe no-op, changed false; to change columns use mira_task_move. Returns the task row and changed. Requires a key with changes allowed. On rate_limited wait retry_after seconds; if over an hour, stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "url": {
+          "type": "string"
+        },
+        "board_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stage_id": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "board_id"
+      ],
+      "oneOf": [
+        {
+          "required": [
+            "task_id"
+          ],
+          "not": {
+            "required": [
+              "url"
+            ]
+          }
+        },
+        {
+          "required": [
+            "url"
+          ],
+          "not": {
+            "required": [
+              "task_id"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_board_list",
+    "description": "List the Mira boards where the user may create tasks, with their columns in board order. Each column has a status `ecat` (1 To do, 2 In progress, 3 Under review, 4 Done); `done` is `ecat = 4`. New tasks cannot go to a column with `ecat` 3 or 4. `project` is null for a board outside projects. Call this before mira_task_create to pick `board_id` and `stage_id`. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_people_list",
+    "description": "Find people of the company in the Mira directory: who someone is, who heads a department, who reports to whom, how to reach a colleague. Each person has `id`, `name`, work `email`, `departments` (department `id` and `name`, `position` in it, `is_head`) and `managers` (line managers derived from the department tree: usually one; the active company head has none, top department heads and people without a department report to the active company head, if appointed). Filters combine with AND: `q` matches part of a name, email, position or department name; `department_id` (from mira_department_list) returns that department with all its sub-departments; `manager_id` returns direct reports of that person; `id` returns just that person. `me` in the answer is the user's own id: for \"who is my manager\" call with `id` = `me`. People go by id, `limit` per page (default 50); when `next_cursor` is not null, pass it as `cursor` for the next page. People who left the company are not listed. Use departments to tell apart people with the same name; if the right person is still unclear, ask the user. Pick `assignee_id` and `mentions` for mira_task_create, mira_task_edit and mira_task_comment here. Refusal `department_not_found` means there is no such department. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Part of a name, email, position or department name; case does not matter."
+        },
+        "department_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Department id from mira_department_list: people of it and of its sub-departments."
+        },
+        "manager_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Person id: their direct reports."
+        },
+        "id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Person id: just this person."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Max people per page, default 50."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "`next_cursor` from the previous page."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_create",
+    "description": "Create a task on a Mira board, or a subtask of an existing task, on behalf of the user, like the task form in Mira. Order: boards and columns from mira_board_list, people from mira_people_list, then this call. For a subtask pass `parent_id` (the parent's `id` from mira_task_list or mira_task_get) instead of `board_id`: the subtask goes to the parent's board; nesting supports up to 5 levels including the main task (`task_depth_limit` with `limit` in the response if exceeded), and only a participant of the parent (author, assignee, helper) or someone allowed to write on its board may add one (`not_allowed`). The assignee gets a notification. Generate a new UUID as `request_id` for each new task; if a call fails without an answer, repeat it with the same `request_id`, title, board and parent: you get the same task with `created: false`, no duplicate. Refusal `request_id_reused` means that `request_id` belongs to a task with another title, board or parent: use a new one. Returns the task row with `id`, `url` (give it to the user) and `created`. Needs a key with changes allowed. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "description": "Repeat key: a new UUID for each new task, the same one when repeating a call."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Task title."
+        },
+        "board_id": {
+          "type": "integer",
+          "description": "Board id from mira_board_list. Required for a task; omit for a subtask (`parent_id`)."
+        },
+        "parent_id": {
+          "type": "integer",
+          "description": "Parent task id for a subtask (from mira_task_list or mira_task_get). Pass either `board_id` or `parent_id`."
+        },
+        "stage_id": {
+          "type": "integer",
+          "description": "Column id of the task's board with `ecat` 1 or 2 (mira_board_list). Omit for the first column; for a subtask whose board is not in mira_board_list, omit."
+        },
+        "descr": {
+          "type": "string",
+          "maxLength": 100000,
+          "description": "Task description in Markdown."
+        },
+        "assignee_id": {
+          "type": "integer",
+          "description": "Assignee id from mira_people_list. Omit to assign the task to the user."
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "urgent"],
+          "description": "Priority; omit for normal."
+        },
+        "due_on": {
+          "type": "string",
+          "format": "date",
+          "description": "Due date, YYYY-MM-DD."
+        },
+        "checklist": {
+          "type": "array",
+          "maxItems": 100,
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "description": "Checklist items: the steps of the work."
+        }
+      },
+      "required": ["request_id", "title"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_comment",
+    "description": "Add a text comment to a Mira task on behalf of the user, like the comment box in the task card. All task members see it under the user's name and get a notification; there is no mark that a program wrote it, so introduce yourself in the text if that matters. This JSON tool accepts text only, Markdown, up to 25000 characters. To upload a report or add a comment with files, use signed HTTP multipart with an API key: docs/api/example.py --task ID --body TEXT --attach PATH (repeat --attach for more files). Binary upload is not provided by this MCP tool; passing local paths or file metadata here does not upload bytes. To notify people, put their ids from mira_people_list in `mentions` (at most 10); a mentioned person becomes a watcher of the task and so gets access to it. Generate a new UUID as `request_id` for each new comment; if a call fails without an answer, repeat it with the same `request_id`, task, text, reply target and mentions: you get the same comment with `created: false`, no duplicate. Refusal `comment_rate` means the user already wrote 10 comments to this task within the last hour: wait `retry_after` seconds or write less often. Refusal `comment_limit` means the task is full: do not comment there. Returns the comment as in `comments` of mira_task_get, plus `task_id` and `created`. Needs a key with changes allowed. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,64}$",
+          "description": "Repeat key: a new UUID for each new comment, the same one when repeating a call."
+        },
+        "task_id": {
+          "type": "integer",
+          "description": "Task number."
+        },
+        "url": {
+          "type": "string",
+          "description": "Task link exactly as the user gave it, e.g. https://host/tasks/Abcd_Q/42."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 25000,
+          "description": "Comment text in Markdown."
+        },
+        "reply_to_id": {
+          "type": "integer",
+          "description": "Id of a comment of this task to reply to (`comments[].id` of mira_task_get)."
+        },
+        "mentions": {
+          "type": "array",
+          "maxItems": 10,
+          "items": { "type": "integer" },
+          "description": "Ids of people to notify, from mira_people_list."
+        }
+      },
+      "required": ["request_id", "body"],
+      "oneOf": [
+        { "required": ["task_id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["task_id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_edit",
+    "description": "Change a Mira task on behalf of the user, like the edit form in the task card: title, description, assignee, priority, due date, parent. Pass only the fields to change, at least one; the rest stay as they are. `null` removes the due date or the description, or detaches the task from its parent; title, assignee and priority cannot be empty. `parent_id` makes the task a subtask of that task (or changes its parent): up to 5 levels including the main task and the full subtree being attached (`task_depth_limit` with `limit` in the response if exceeded); a task cannot be attached to itself (`bad_request`) or one of its descendants (`task_cycle`), only a participant of the parent (author, assignee, helper) or someone allowed to write on its board may do it (`not_allowed`); the task and its descendants move to the parent's board when they differ. Only the task author and people allowed to write on its board may edit: refusal `not_allowed` means the user may not, so tell them. A new assignee gets a notification; take people from mira_people_list. The description is text only: images of attachments are not accepted, so leave such a description to the user. Repeating a call is safe: if the task already has these values you get `changed: false` and nothing is written. Returns the task row with `id`, `url` and `changed`. Needs a key with changes allowed. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "description": "Task number."
+        },
+        "url": {
+          "type": "string",
+          "description": "Task link exactly as the user gave it, e.g. https://host/tasks/Abcd_Q/42."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "New task title."
+        },
+        "descr": {
+          "type": ["string", "null"],
+          "maxLength": 100000,
+          "description": "New description in Markdown; null removes the description."
+        },
+        "assignee_id": {
+          "type": "integer",
+          "description": "New assignee id from mira_people_list."
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "urgent"],
+          "description": "New priority."
+        },
+        "due_on": {
+          "type": ["string", "null"],
+          "format": "date",
+          "description": "New due date, YYYY-MM-DD; null removes the due date."
+        },
+        "parent_id": {
+          "type": ["integer", "null"],
+          "description": "Parent task id to make this task its subtask (or change the parent); null detaches it."
+        }
+      },
+      "oneOf": [
+        { "required": ["task_id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["task_id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_checklist",
+    "description": "Change the checklist of a Mira task on behalf of the user, like the checklist in the task card. One action per call: `add` appends items from `titles` to the end of the list; `rename` sets a new `title` of item `check_id`; `mark` checks (`done: true`) or unchecks (`done: false`) item `check_id`; `delete` removes item `check_id`; `reorder` sets the order: `ids` lists every item id of the task exactly once. Item ids come from `checklist_items` of mira_task_get or of this tool's previous answer. Pass only the fields of the chosen action. Checking items is allowed to the assignee, helpers, the author and people allowed to write on the task board; the other actions to all of them except helpers. Refusal `not_allowed` means the user may not, so tell them; `task_closed` means the task is done or cancelled and its checklist is read-only; `check_not_found` means there is no such item in the task: read the task again; `checklist_too_long` means the list would exceed 100 items. Repeating `rename`, `mark` or `reorder` is safe: if the item already looks so you get `changed: false` and nothing is written; repeating `add` adds the items again, so check the answer before retrying. Returns the whole checklist: `checklist` with done and total counts, `checklist_items` and `changed`. Needs a key with changes allowed. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "task_id": {
+          "type": "integer",
+          "description": "Task number."
+        },
+        "url": {
+          "type": "string",
+          "description": "Task link exactly as the user gave it, e.g. https://host/tasks/Abcd_Q/42."
+        },
+        "action": {
+          "type": "string",
+          "enum": ["add", "rename", "mark", "delete", "reorder"],
+          "description": "What to do with the checklist."
+        },
+        "titles": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 500 },
+          "minItems": 1,
+          "maxItems": 100,
+          "description": "For `add`: texts of the new items, in order."
+        },
+        "check_id": {
+          "type": "integer",
+          "description": "For `rename`, `mark` and `delete`: item id from `checklist_items`."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "For `rename`: new text of the item."
+        },
+        "done": {
+          "type": "boolean",
+          "description": "For `mark`: true checks the item, false unchecks it."
+        },
+        "ids": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "description": "For `reorder`: every item id of the task in the new order."
+        }
+      },
+      "required": ["action"],
+      "oneOf": [
+        { "required": ["task_id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["task_id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_task_file",
+    "description": "Download the content of a task attachment by id. Images in a task description or comments are links like `attachment:<id>`: fetch their content with this tool, and tell the type by `mime` in the task's `attachments`. Returns the raw file bytes. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "type": "integer",
+          "description": "Attachment id: the <id> of `attachment:<id>` or `attachments[].id` from mira_task_get."
+        }
+      },
+      "required": ["attachment_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_knowledge_search",
+    "description": "Search published articles of the company knowledge base in Mira that the user can read: company rules, policies, how-tos. Matches titles and text; returns up to `limit` hits (default 20, max 50) with a plain-text `snippet`, the article `url`, space and category. Hits in titles come first. Narrow with `space_id` when the user names a section (ids from mira_knowledge_space). If nothing is found, rephrase the query once with other words, then tell the user there is no such article. Read the full text with mira_knowledge_article before quoting rules. Refusal `bad_query` means `q` is shorter than 2 or longer than 100 characters. Refusal `space_not_found` means there is no such space or the user cannot read it. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 100,
+          "description": "Words to search for, in the language of the articles."
+        },
+        "space_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Search only in this space."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max hits. Default 20."
+        }
+      },
+      "required": ["q"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_knowledge_article",
+    "description": "Read one published article of the company knowledge base in Mira by `id` or by its link `url` (<Mira address>/knowledge/<id>); pass exactly one. `body` is Markdown as written by the company: quote and summarize from it and give the user the article `url`. Links inside `body` like `/knowledge/<id>` are other articles: read them with this tool by `id`. `attachments` lists files [{id, name, mime, size}]: fetch a file's content with mira_knowledge_file by its `id`. `translations` are the same article in other languages. Drafts and archived articles are not available: refusal `not_found` means the article does not exist, is not published, or the user cannot read it. Refusal `bad_link` means the link is not an article of this Mira. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Article id."
+        },
+        "url": {
+          "type": "string",
+          "description": "Article link copied from Mira."
+        }
+      },
+      "oneOf": [
+        { "required": ["id"], "not": { "required": ["url"] } },
+        { "required": ["url"], "not": { "required": ["id"] } }
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_knowledge_space",
+    "description": "Browse the company knowledge base in Mira that the user can read. Without arguments: the spaces (sections) with descriptions and the number of published articles. With `space_id`: that space with its categories and all its published articles (title, `url`, category). Use it when the user asks what exists on a topic without exact words to search, or to find a `space_id` for mira_knowledge_search. Refusal `space_not_found` means there is no such space or the user cannot read it. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "space_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Space to open; omit to list spaces."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_knowledge_file",
+    "description": "Download the content of a file attached to a published knowledge base article: `attachments[].id` from mira_knowledge_article. Tell the type by `mime` there. Returns the file itself: text as text up to 256 KiB, an image as an image up to 3.75 MiB, anything else as an embedded resource up to 4 MiB. Refusal `file_too_large` means the file is bigger: tell the user it can be downloaded with an API key by knowledge_api_file_get. Refusal `not_found` means there is no such file, its article is not published, or the user cannot read its space. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "File id: `attachments[].id` of an article from mira_knowledge_article."
+        }
+      },
+      "required": ["attachment_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_department_list",
+    "description": "List the departments of the company as a tree, with top-level `head_user_id` (the active company head, null if none): `id`, `name`, `descr`, `parent_id` (null for a top department), `head` (the department head, null if none), `people` (people in the department itself) and `people_total` (with all sub-departments). Use it for questions about the company structure and to get `department_id` for mira_people_list, which lists the people of a department. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_absence_list",
+    "description": "List who is absent in Mira (vacation, sick leave, time off) within a date window of at most 62 days: records that overlap `from`..`to` by at least one day. Each record: `person` {id, name}, `start_date`, `end_date`, `unit` (`day`; `half_day` with `half_day_part` `am`/`pm`; `hours` with `start_time`/`end_time`), `type` (the leave type name, or null when the type is hidden from colleagues: the person is away, the reason is private) and `status` (`approved`, `confirmed` = recorded without a request, `pending` = the user's own request or, for HR, anyone's request awaiting a decision). Rejected requests are never listed. Use it for \"who is on vacation next week\", \"when is Irina back\", \"is anyone from accounting away on Friday\". Filters combine with AND: `person_id` (from mira_people_list), `department_id` (includes sub-departments, from mira_department_list). The response has `me`, the user's own id: for \"my vacations\" call with `person_id` = `me`. If `next_cursor` is not null there are more records: call again with `cursor` = `next_cursor`. Refusal `bad_request` means wrong input (missing window, window over 62 days, `to` before `from`); `department_not_found` means no such department. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "type": "string",
+          "format": "date",
+          "description": "First day of the window, YYYY-MM-DD."
+        },
+        "to": {
+          "type": "string",
+          "format": "date",
+          "description": "Last day of the window, YYYY-MM-DD, not before `from`; the window is at most 62 days."
+        },
+        "person_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Only this person's absences."
+        },
+        "department_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Only people of this department and its sub-departments."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 200,
+          "description": "Records per page, 100 by default."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "`next_cursor` of the previous response."
+        }
+      },
+      "required": ["from", "to"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_leave_balance",
+    "description": "Show the user's remaining leave in Mira for the current leave cycle (calendar year or year from hire date, as the company set it), per leave type that counts against a balance: `available` (days that can be taken now), `accrued` (earned in the cycle so far), `carried_in` (carried over from the previous cycle), `taken`, `cycle_start`, `cycle_end`; `unlimited: true` means the type has no allowance and the numbers mean nothing. Use it for \"how many vacation days do I have left\". Without arguments it is the user's own balance; `person_id` shows another person's balance only to users who manage time off in Mira (otherwise refusal `forbidden`). Refusal `person_not_found` means no such person in the company. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "person_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Whose balance; omit for the user's own."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_leave_types",
+    "description": "List the leave types the user can request in Mira (vacation, sick leave, unpaid leave and so on, as the company set them up): `id`, `name`, `paid`, `counts_against_balance` (days come off the balance), `attachment_required` (a document is needed: such a request cannot be filed here, the user files it in Mira), `min_days_per_request` and `max_days_per_request` (null when there is no limit). Call it before mira_leave_request to pick `type_id` by the name the user said. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_leave_request",
+    "description": "File a leave request in Mira for the user themselves, exactly like the request form: it goes to the approvers set for the leave type and they are notified; a person always decides it. Only for the user, never for another person. Dates are inclusive `YYYY-MM-DD`; `unit` is `day` (default), `half_day` (one date, `half_day_part` `am` or `pm`) or `hours` (one date, `start_time` and `end_time` as `HH:MM`). Confirm the type and dates with the user before calling. Returns the request: `id`, `status` (`pending` waits for approval; `approved` only when calling again for a request already approved), `type`, dates, `days` that come off the balance (null for a type without a balance) and `created`. Calling again with the same type, dates and times is safe: you get the existing request with `created: false`. Refusals: `type_not_found` (no such active type: list types with mira_leave_types), `unit_not_allowed` (choose a coarser unit), `attachment_required` (the type needs a document: tell the user to file it in Mira), `insufficient_balance`, `leave_overlap` (the user already has leave on these days), `period_closed` (payroll for these dates is closed), `probation_block`, `service_too_short`, `backdate_too_old`, `days_per_request`, `year_cap_exceeded` (rules of the leave type): explain the reason to the user, do not retry. Needs a key with changes allowed. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "type_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Leave type id from mira_leave_types."
+        },
+        "start_date": {
+          "type": "string",
+          "description": "First day of leave, YYYY-MM-DD."
+        },
+        "end_date": {
+          "type": "string",
+          "description": "Last day of leave, YYYY-MM-DD; the same as start_date for half_day and hours."
+        },
+        "unit": {
+          "type": "string",
+          "enum": ["day", "half_day", "hours"],
+          "description": "Whole days (default), half of one day or hours within one day."
+        },
+        "half_day_part": {
+          "type": "string",
+          "enum": ["am", "pm"],
+          "description": "For `half_day`: morning or afternoon."
+        },
+        "start_time": {
+          "type": "string",
+          "description": "For `hours`: start, HH:MM."
+        },
+        "end_time": {
+          "type": "string",
+          "description": "For `hours`: end, HH:MM, after start_time."
+        },
+        "note": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Comment to the request, as the user wrote it."
+        }
+      },
+      "required": ["type_id", "start_date", "end_date"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_leave_approvals",
+    "description": "List the leave requests in Mira that wait for the user's decision: requests where the user is an approver of the current step. Other kinds of requests (expenses, attendance) are not included. Each request has `attachment_revision` (including removal events; 0 when no history), `attachment` metadata or null, `leave_id`, `person`, `type`, dates, `unit`, `days`, `balance_before` and `balance_after` (the balance before and after this request, null for a type without a balance), `submitted_at` and `waiting_since` (UTC), `step` of `steps`, `deadline_days` and `overdue_days` (working days over the step deadline). Oldest first. Use it for \"what is waiting for my approval\". Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_leave_decide",
+    "description": "Approve or reject a leave request in Mira as its approver, like the buttons in Approvals. Only a request from mira_leave_approvals can be decided: the user must be an approver of its current step and not the applicant. Rejecting needs `reason`, which the applicant sees; ask the user for it. Confirm the decision with the user before calling. Returns `status`: `approved` or `rejected` when the decision was final, `pending` when the request moved on to the next approval step; `changed`. Repeating the same decision is safe: you get `changed: false`. Refusals: `leave_not_found` (no such request waiting for the user: list them again), `already_decided` (the user already made the opposite decision). Needs a key with changes allowed. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "leave_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Request number `leave_id` from mira_leave_approvals."
+        },
+        "decision": {
+          "type": "string",
+          "enum": ["approve", "reject"],
+          "description": "Approve or reject."
+        },
+        "expected_attachment_revision": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Shown attachment_revision from mira_leave_approvals; 0 only if reported by the queue. On attachment_conflict refresh and confirm a new decision."
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "description": "Why: required to reject, the applicant sees it."
+        }
+      },
+      "required": ["leave_id", "decision", "expected_attachment_revision"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_chat_group_list",
+    "description": "List the chat groups (channels) the user is a member of in this Mira company: public and private, with `id`, `title`, `description`, `is_public`, `is_default`, `archived`, `my_role` (owner/admin/member), `members` count, `unread` (messages the user has not read yet) and `last_read_id`. Direct messages are never listed or readable: this covers group chats only. Freshest activity first; `q` filters by part of a title or description; `archived: true` includes archived groups. For \"what did I miss in #sales\" take `last_read_id` and call mira_chat_message_list with `since_id` = that value. Reading through this API does not mark anything as read. Refusal `rate_limited` means too many calls: wait `retry_after` seconds; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Part of a group title or description; case does not matter."
+        },
+        "archived": {
+          "type": "boolean",
+          "description": "true — include archived groups (read-only). Default false."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_chat_message_list",
+    "description": "Read messages of one chat group the user is a member of (group `id` from mira_chat_group_list), or the replies of one thread (`thread_id` = id of the root message). Each message has `id`, `author` {id, name}, `body` (chat markup, see mira_chat_post; people are mentioned as `<@id>`), `mentions` [{id, name}], `created_at`, `edited_at`, `deleted`, `reply_to_id`, `thread` ({replies, last_at} for a root with replies, else null) and `attachments` [{id, name, mime, size}] — fetch a file's content with mira_chat_file by its `id`. The page holds the latest `limit` messages (default 50, max 100) in time order; when `next_cursor` is not null, pass it as `cursor` for older messages. `since_id` returns only messages newer than that id (use `last_read_id` from mira_chat_group_list for \"what did I miss\"). With `thread_id` the answer also carries `root`. Reading does not mark messages as read. Direct messages are never listed or readable: this covers group chats only. Refusal `group_not_found` means there is no such group or the user is not a member of it; `thread_not_found` — no such thread root in this group. Refusal `rate_limited` means too many calls: wait `retry_after` seconds; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "group_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Group id from mira_chat_group_list."
+        },
+        "thread_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Id of a root message: read the replies of its thread."
+        },
+        "since_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Only messages newer than this message id."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Max messages per page, default 50."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "`next_cursor` from the previous page (older messages)."
+        }
+      },
+      "required": [
+        "group_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_chat_search",
+    "description": "Search message text across the chat groups the user is a member of (direct messages are not searched). `q` is a substring, case does not matter, at least 3 characters; `group_id` narrows to one group. Each result has `id`, `group` {id, title}, `thread_id` (null for a feed message, else the root of its thread), `author` {id, name}, `snippet` (text around the match, people as `<@id>`) and `created_at`; newest first, `limit` per page (default 20, max 50), `next_cursor` → `cursor` for older results. To read the full message and its context call mira_chat_message_list with the group (and `thread_id` for a reply). Refusal `bad_request` with a short `q` means the query must be at least 3 characters. Refusal `rate_limited` means too many calls: wait `retry_after` seconds; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "q": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200,
+          "description": "Text to find, at least 3 characters."
+        },
+        "group_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Search only in this group."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "Max results per page, default 20."
+        },
+        "cursor": {
+          "type": "string",
+          "description": "`next_cursor` from the previous page."
+        }
+      },
+      "required": [
+        "q"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_chat_post",
+    "description": "Post a message to a chat group the user is a member of, or reply in a thread (`thread_id` = id of the root message). Every member of the group sees it under the user's own name, so confirm the text with the user before posting. Text uses Mira chat markup, NOT Markdown: *bold*, _italic_, ~strike~, `code`, ``` code block ```, > quote, lists with `- ` or `1. `; `**double stars**`, `#` headings and `[text](url)` links do not render — write a URL as plain text. Mention a person as `<@id>` with the id from mira_people_list (they get a notification); `@channel` and `@here` are refused (`mass_mention_denied`). Files cannot be attached. Direct messages cannot be sent through this API. `request_id` is a repeat key: generate a new UUID per message and reuse the same one when retrying after a network error — the same message comes back with `created: false` and nothing is posted twice. Needs a connection with write access. Refusals: `group_not_found` (no such group or not a member), `group_archived`, `thread_not_found`, `person_not_in_group` (`ids` lists who is not in the group), `request_id_reused`, `send_rate` (wait `retry_after` seconds). Refusal `rate_limited` means too many calls: wait `retry_after` seconds; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "Repeat key: a new UUID per message; the same one when retrying."
+        },
+        "group_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Group id from mira_chat_group_list."
+        },
+        "thread_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Id of a root message: reply in its thread."
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 50000,
+          "description": "Message text in Mira chat markup (not Markdown); people as `<@id>`."
+        }
+      },
+      "required": [
+        "request_id",
+        "group_id",
+        "body"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "mira_chat_file",
+    "description": "Download the content of a file attached to a chat group message: `attachments[].id` from mira_chat_message_list. Tell the type by `mime` there. Returns the file itself: text as text up to 256 KiB, an image as an image up to 3.75 MiB, anything else as an embedded resource up to 4 MiB. Refusal `file_too_large` means the file is bigger: tell the user it can be downloaded with an API key by chat_api_file_get. Files of direct messages are never available. Refusal `group_not_found` means there is no such file, or it is in a group the user is not a member of, or its message was deleted. Refusal `rate_limited` means too many calls: wait `retry_after` seconds before calling again; if `retry_after` is over an hour, the daily limit is used up: stop and tell the user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "attachment_id": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "File id: `attachments[].id` of a message from mira_chat_message_list."
+        }
+      },
+      "required": ["attachment_id"],
+      "additionalProperties": false
+    }
+  }
+]
