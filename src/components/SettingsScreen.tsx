@@ -11,8 +11,19 @@ import {
 } from 'lucide-react';
 import { useMemo, useRef, useState } from 'react';
 import { formatShortDateTime } from '../lib/format';
+import {
+  GEMINI_MODELS,
+  getGeminiModelOption,
+  normalizeThinkingLevelForModel,
+  THINKING_LEVEL_META,
+} from '../lib/geminiConfig';
 import { DEFAULT_SETTINGS } from '../lib/storage';
-import type { AppSettings, TrackerCache } from '../types';
+import type {
+  AppSettings,
+  GeminiModelId,
+  GeminiThinkingLevel,
+  TrackerCache,
+} from '../types';
 
 interface SettingsScreenProps {
   settings: AppSettings;
@@ -62,6 +73,11 @@ export function SettingsScreen({
     const filtered = defaultBoard.stages.filter((s) => s.ecat === 1 || s.ecat === 2);
     return filtered.length > 0 ? filtered : defaultBoard.stages;
   }, [defaultBoard]);
+
+  const activeModelOption = useMemo(
+    () => getGeminiModelOption(settings.geminiModel),
+    [settings.geminiModel]
+  );
 
   return (
     <div className="h-full overflow-y-auto overscroll-contain bg-[#121212] px-4 py-5">
@@ -226,6 +242,75 @@ export function SettingsScreen({
           ) : null}
         </section>
 
+        {/* AI Model & Reasoning Level */}
+        <section className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#1E1E1E] p-4">
+          <div>
+            <h3 className="text-sm font-semibold text-white">Модель ИИ и уровень рассуждений</h3>
+            <p className="mt-0.5 text-xs text-zinc-400">
+              Эти параметры можно менять и прямо на экране чата перед отправкой.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <label htmlFor="gemini-model" className="block text-xs font-medium text-zinc-300">
+                Модель Gemini
+              </label>
+              <select
+                id="gemini-model"
+                value={settings.geminiModel}
+                onChange={(e) => {
+                  const nextModel = e.target.value as GeminiModelId;
+                  onChangeSettings({
+                    ...settings,
+                    geminiModel: nextModel,
+                    thinkingLevel: normalizeThinkingLevelForModel(
+                      nextModel,
+                      settings.thinkingLevel
+                    ),
+                  });
+                }}
+                className="min-h-[44px] w-full rounded-xl border border-white/[0.08] bg-[#121212] px-3 py-2 text-sm text-white focus:border-[#3B82F6] focus:outline-none"
+              >
+                {GEMINI_MODELS.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] leading-relaxed text-zinc-500">
+                {activeModelOption.description}
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor="thinking-level" className="block text-xs font-medium text-zinc-300">
+                Уровень рассуждений
+              </label>
+              <select
+                id="thinking-level"
+                value={settings.thinkingLevel}
+                onChange={(e) =>
+                  onChangeSettings({
+                    ...settings,
+                    thinkingLevel: e.target.value as GeminiThinkingLevel,
+                  })
+                }
+                className="min-h-[44px] w-full rounded-xl border border-white/[0.08] bg-[#121212] px-3 py-2 text-sm text-white focus:border-[#3B82F6] focus:outline-none"
+              >
+                {activeModelOption.supportedThinkingLevels.map((lvl) => (
+                  <option key={lvl} value={lvl}>
+                    {THINKING_LEVEL_META[lvl].label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] leading-relaxed text-zinc-500">
+                {THINKING_LEVEL_META[settings.thinkingLevel].hint}.
+              </p>
+            </div>
+          </div>
+        </section>
+
         {/* Image Upload Endpoint (Optional) */}
         <section className="space-y-3 rounded-2xl border border-white/[0.08] bg-[#1E1E1E] p-4">
           <div className="space-y-1.5">
@@ -244,9 +329,9 @@ export function SettingsScreen({
               className="min-h-[44px] w-full rounded-xl border border-white/[0.08] bg-[#121212] px-3.5 py-2.5 font-mono text-xs text-white placeholder:text-zinc-600 focus:border-[#3B82F6] focus:outline-none"
             />
             <p className="text-[11px] leading-relaxed text-zinc-500">
-              По умолчанию скриншот автоматически прикрепляется во вложения созданной задачи в трекере (через{' '}
-              <span className="font-mono text-zinc-400">task_api_attach_set</span>). Внешний URL нужен только если вы хотите загружать картинку на свой сервер и вставлять в описание как{' '}
-              <span className="font-mono text-zinc-400">![Скриншот](url)</span>.
+              По умолчанию скриншот отправляется прямо в{' '}
+              <span className="font-mono text-zinc-400">task_api_create_set</span> и встраивается в описание через{' '}
+              <span className="font-mono text-zinc-400">draft:1</span>. Внешний URL нужен только для загрузки на ваш хостинг.
             </p>
           </div>
         </section>

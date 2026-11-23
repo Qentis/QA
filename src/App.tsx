@@ -12,11 +12,13 @@ import { ToastContainer } from './components/ToastContainer';
 import {
   clearAllMessages,
   deleteDraftById,
+  deleteMessageById,
   getAllDrafts,
   getAllMessages,
   saveDraft,
   saveMessage,
 } from './lib/db';
+import { normalizeThinkingLevelForModel } from './lib/geminiConfig';
 import { generateUuidV4, type ProcessedImage } from './lib/imageUtils';
 import {
   loadSettings,
@@ -29,12 +31,16 @@ import {
   attachScreenshotToTrackerTask,
   createTrackerTask,
   fetchBoardsAndPeople,
+  GeminiAnalyzeError,
   uploadScreenshotImage,
 } from './lib/trackerApi';
 import type {
   ActiveTab,
   AppSettings,
   ChatMessage,
+  GeminiModelId,
+  GeminiThinkingLevel,
+  RetryAnalyzePayload,
   TaskDraft,
   ToastItem,
   TrackerCache,
@@ -131,30 +137,47 @@ export default function App() {
     }
   }, [addToast, settings.apiToken, settings.baseUrl]);
 
-  const handleSendToGemini = useCallback(
-    async ({ image, comment }: { image: ProcessedImage | null; comment: string }) => {
-      const now = Date.now();
-      const userMsg: ChatMessage = {
-        id: generateUuidV4(),
-        role: 'user',
-        text: comment,
-        imageDataUrl: image?.dataUrl,
-        imageName: image?.fileName,
-        createdAt: now,
-      };
+  const handleChangeGeminiConfig = useCallback(
+    (model: GeminiModelId, level: GeminiThinkingLevel) => {
+      const normalizedLevel = normalizeThinkingLevelForModel(model, level);
+      setSettings((prev) => {
+        const next: AppSettings = {
+          ...prev,
+          geminiModel: model,
+          thinkingLevel: normalizedLevel,
+        };
+        saveSettings(next);
+        return next;
+      });
+    },
+    []
+  );
 
-      setMessages((prev) => [...prev, userMsg]);
-      await saveMessage(userMsg);
+  const runGeminiAnalysis = useCallback(
+    async (
+      payload: RetryAnalyzePayload,
+      modelOverride?: GeminiModelId
+    ) => {
+      const activeModel = modelOverride ?? settings.geminiModel;
+      const activeThinkingLevel = normalizeThinkingLevelForModel(
+        activeModel,
+        settings.thinkingLevel
+      );
 
       setIsGenerating(true);
       try {
+        const imageBase64 = payload.imageDataUrl
+          ? payload.imageDataUrl.split(',')[1] || payload.imageDataUrl
+          : undefined;
+
         const result = await analyzeScreenshotWithGemini({
-          imageBase64: image?.base64,
-          mimeType: image?.mimeType,
-          comment,
+          imageBase64,
+          mimeType: payload.imageMimeType,
+          comment: payload.comment,
+          model: activeModel,
+          thinkingLevel: activeThinkingLevel,
         });
 
-        // Resolve default board & stage from cache if available
         const defaultBoard =
           cache.boards.find((b) => b.id === settings.defaultBoardId) ??
           cache.boards[0] ??
@@ -177,10 +200,10 @@ export default function App() {
           boardId: defaultBoard?.id ?? null,
           stageId: defaultStage?.id ?? null,
           assigneeId: settings.defaultAssigneeId ?? null,
-          imageDataUrl: image?.dataUrl,
-          imageMimeType: image?.mimeType,
-          imageName: image?.fileName,
-          userComment: comment,
+          imageDataUrl: payload.imageDataUrl,
+          imageMimeType: payload.imageMimeType,
+          imageName: payload.imageName,
+          userComment: payload.comment,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
@@ -193,7 +216,11 @@ export default function App() {
           role: 'assistant',
           text: result.title,
           taskId: newDraft.id,
-          generatedTask: result,
+          generatedTask: {
+            ...result,
+            model: result.modelUsed ?? activeModel,
+            thinkingLevel: result.thinkingLevelUsed ?? activeThinkingLevel,
+          },
           createdAt: Date.now(),
         };
 
@@ -203,10 +230,13 @@ export default function App() {
         addToast('success', 'Черновик создан', 'Задача сохранена во вкладку «Задачи».');
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Ошибка генерации через Gemini API';
+        const errorCode = err instanceof GeminiAnalyzeError ? err.code : undefined;
         const errorMsg: ChatMessage = {
           id: generateUuidV4(),
           role: 'error',
           text: msg,
+          errorCode,
+          retryPayload: payload,
           createdAt: Date.now(),
         };
         await saveMessage(errorMsg);
@@ -222,7 +252,75 @@ export default function App() {
       settings.defaultAssigneeId,
       settings.defaultBoardId,
       settings.defaultStageId,
+      settings.geminiModel,
+      settings.thinkingLevel,
     ]
+  );
+
+  const handleSendToGemini = useCallback(
+    async ({ image, comment }: { image: ProcessedImage | null; comment: string }) => {
+      const payload: RetryAnalyzePayload = {
+        imageDataUrl: image?.dataUrl,
+        imageMimeType: image?.mimeType,
+        imageName: image?.fileName,
+        comment,
+      };
+
+      const userMsg: ChatMessage = {
+        id: generateUuidV4(),
+        role: 'user',
+        text: comment,
+        imageDataUrl: image?.dataUrl,
+        imageMimeType: image?.mimeType,
+        imageName: image?.fileName,
+        retryPayload: payload,
+        createdAt: Date.now(),
+      };
+
+      setMessages((prev) => [...prev, userMsg]);
+      await saveMessage(userMsg);
+      await runGeminiAnalysis(payload);
+    },
+    [runGeminiAnalysis]
+  );
+
+  const handleRetryRequest = useCallback(
+    async ({
+      payload,
+      errorMessageId,
+      modelOverride,
+    }: {
+      payload: RetryAnalyzePayload;
+      errorMessageId?: string;
+      modelOverride?: GeminiModelId;
+    }) => {
+      if (isGenerating) return;
+
+      if (modelOverride) {
+        handleChangeGeminiConfig(modelOverride, settings.thinkingLevel);
+      }
+
+      if (errorMessageId) {
+        setMessages((prev) => prev.filter((m) => m.id !== errorMessageId));
+        await deleteMessageById(errorMessageId);
+      } else {
+        const userMsg: ChatMessage = {
+          id: generateUuidV4(),
+          role: 'user',
+          text: payload.comment,
+          imageDataUrl: payload.imageDataUrl,
+          imageMimeType: payload.imageMimeType,
+          imageName: payload.imageName,
+          retryPayload: payload,
+          createdAt: Date.now(),
+        };
+        setMessages((prev) => [...prev, userMsg]);
+        await saveMessage(userMsg);
+      }
+
+      await runGeminiAnalysis(payload, modelOverride);
+    },
+    [handleChangeGeminiConfig, isGenerating, runGeminiAnalysis, settings.thinkingLevel]
   );
 
   const handleUpdateDraft = useCallback((updated: TaskDraft) => {
@@ -487,7 +585,11 @@ export default function App() {
               messages={messages}
               isGenerating={isGenerating}
               hasTrackerToken={Boolean(settings.apiToken.trim())}
+              geminiModel={settings.geminiModel}
+              thinkingLevel={settings.thinkingLevel}
+              onChangeGeminiConfig={handleChangeGeminiConfig}
               onSend={handleSendToGemini}
+              onRetryRequest={handleRetryRequest}
               onOpenTask={handleOpenTaskFromChat}
               onClearChat={handleClearChat}
               onOpenSettings={() => setActiveTab('settings')}

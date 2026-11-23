@@ -1,9 +1,29 @@
-import type { Priority, TrackerBoard, TrackerPerson, TrackerStage } from '../types';
+import type {
+  GeminiModelId,
+  GeminiThinkingLevel,
+  Priority,
+  TrackerBoard,
+  TrackerPerson,
+  TrackerStage,
+} from '../types';
 
 export interface GeminiAnalyzeResult {
   title: string;
   descr: string;
   priority: Priority;
+  modelUsed?: GeminiModelId;
+  thinkingLevelUsed?: GeminiThinkingLevel;
+}
+
+export class GeminiAnalyzeError extends Error {
+  status: number;
+  code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
 }
 
 export class TrackerApiError extends Error {
@@ -146,6 +166,8 @@ export async function analyzeScreenshotWithGemini(params: {
   imageBase64?: string;
   mimeType?: string;
   comment: string;
+  model?: GeminiModelId;
+  thinkingLevel?: GeminiThinkingLevel;
 }): Promise<GeminiAnalyzeResult> {
   const resp = await fetch('/api/gemini/analyze', {
     method: 'POST',
@@ -155,10 +177,11 @@ export async function analyzeScreenshotWithGemini(params: {
 
   const data = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
   if (!resp.ok) {
-    throw new Error(
+    const code = typeof data.error === 'string' ? data.error : `http_${resp.status}`;
+    const msg =
       (typeof data.message === 'string' && data.message) ||
-        `Ошибка Gemini (${resp.status})`
-    );
+      `Ошибка Gemini (${resp.status})`;
+    throw new GeminiAnalyzeError(resp.status, code, msg);
   }
 
   const validPriorities = new Set<Priority>(['low', 'normal', 'high', 'urgent']);
@@ -170,6 +193,11 @@ export async function analyzeScreenshotWithGemini(params: {
     title: String(data.title || '[UI]: Проблема на скриншоте'),
     descr: String(data.descr || ''),
     priority,
+    modelUsed: typeof data.modelUsed === 'string' ? (data.modelUsed as GeminiModelId) : undefined,
+    thinkingLevelUsed:
+      typeof data.thinkingLevelUsed === 'string'
+        ? (data.thinkingLevelUsed as GeminiThinkingLevel)
+        : undefined,
   };
 }
 

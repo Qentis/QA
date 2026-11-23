@@ -2,6 +2,7 @@ import {
   ArrowRight,
   ImagePlus,
   Loader2,
+  RotateCw,
   Send,
   Sparkles,
   Trash2,
@@ -10,6 +11,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ClipboardEvent,
@@ -17,15 +19,35 @@ import {
   type KeyboardEvent,
 } from 'react';
 import { formatShortDateTime, PRIORITY_META } from '../lib/format';
+import {
+  formatGeminiErrorDisplay,
+  GEMINI_MODELS,
+  getGeminiModelOption,
+  normalizeThinkingLevelForModel,
+  THINKING_LEVEL_META,
+} from '../lib/geminiConfig';
 import { processImageFile, type ProcessedImage } from '../lib/imageUtils';
-import type { ChatMessage } from '../types';
+import type {
+  ChatMessage,
+  GeminiModelId,
+  GeminiThinkingLevel,
+  RetryAnalyzePayload,
+} from '../types';
 import { MarkdownPreview } from './MarkdownPreview';
 
 interface ChatScreenProps {
   messages: ChatMessage[];
   isGenerating: boolean;
   hasTrackerToken: boolean;
+  geminiModel: GeminiModelId;
+  thinkingLevel: GeminiThinkingLevel;
+  onChangeGeminiConfig: (model: GeminiModelId, level: GeminiThinkingLevel) => void;
   onSend: (params: { image: ProcessedImage | null; comment: string }) => Promise<void>;
+  onRetryRequest: (params: {
+    payload: RetryAnalyzePayload;
+    errorMessageId?: string;
+    modelOverride?: GeminiModelId;
+  }) => Promise<void>;
   onOpenTask: (taskId: string) => void;
   onClearChat: () => void;
   onOpenSettings: () => void;
@@ -33,11 +55,35 @@ interface ChatScreenProps {
   onNotifyError: (title: string, description?: string) => void;
 }
 
+function findPrecedingUserPayload(
+  messages: ChatMessage[],
+  errorIndex: number
+): RetryAnalyzePayload | null {
+  for (let i = errorIndex - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role === 'user') {
+      return (
+        m.retryPayload ?? {
+          imageDataUrl: m.imageDataUrl,
+          imageMimeType: m.imageMimeType,
+          imageName: m.imageName,
+          comment: m.text,
+        }
+      );
+    }
+  }
+  return null;
+}
+
 export function ChatScreen({
   messages,
   isGenerating,
   hasTrackerToken,
+  geminiModel,
+  thinkingLevel,
+  onChangeGeminiConfig,
   onSend,
+  onRetryRequest,
   onOpenTask,
   onClearChat,
   onOpenSettings,
@@ -51,6 +97,8 @@ export function ChatScreen({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const scrollEndRef = useRef<HTMLDivElement>(null);
+
+  const activeModelOption = useMemo(() => getGeminiModelOption(geminiModel), [geminiModel]);
 
   useEffect(() => {
     scrollEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
@@ -131,7 +179,6 @@ export function ChatScreen({
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-      // On desktop (wide screens), Enter sends; on mobile virtual keyboards allow normal newline or send cleanly
       if (window.innerWidth >= 768) {
         e.preventDefault();
         void handleSubmit();
@@ -201,7 +248,7 @@ export function ChatScreen({
               <p className="mt-2 max-w-md text-sm leading-relaxed text-zinc-400">
                 Прикрепите скриншот экрана (или вставьте через{' '}
                 <span className="font-mono text-xs text-zinc-300">Ctrl+V</span>) и напишите
-                короткую заметку — Gemini оформит заголовок, описание и приоритет в черновик.
+                короткую заметку — ИИ оформит заголовок, описание и приоритет в черновик.
               </p>
 
               <div className="mt-6 flex flex-wrap justify-center gap-2.5">
@@ -251,8 +298,14 @@ export function ChatScreen({
                 </button>
               </div>
 
-              {messages.map((msg) => {
+              {messages.map((msg, idx) => {
                 if (msg.role === 'user') {
+                  const userRetryPayload: RetryAnalyzePayload = msg.retryPayload ?? {
+                    imageDataUrl: msg.imageDataUrl,
+                    imageMimeType: msg.imageMimeType,
+                    imageName: msg.imageName,
+                    comment: msg.text,
+                  };
                   return (
                     <div key={msg.id} className="flex justify-end">
                       <div className="max-w-[88%] space-y-2 rounded-2xl rounded-br-md bg-[#2563EB] p-3 text-white shadow-sm sm:max-w-[75%]">
@@ -275,22 +328,83 @@ export function ChatScreen({
                             {msg.text}
                           </p>
                         ) : null}
-                        <p className="text-right text-[11px] text-blue-100/80 tabular-nums">
-                          {formatShortDateTime(msg.createdAt)}
-                        </p>
+                        <div className="flex items-center justify-between gap-3 pt-0.5">
+                          <button
+                            type="button"
+                            disabled={isGenerating}
+                            onClick={() =>
+                              void onRetryRequest({
+                                payload: userRetryPayload,
+                              })
+                            }
+                            aria-label="Отправить запрос снова"
+                            className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg bg-white/10 px-2.5 text-xs font-medium text-blue-50 transition-colors hover:bg-white/20 disabled:opacity-50"
+                          >
+                            <RotateCw className="h-3.5 w-3.5" />
+                            <span>Повторить</span>
+                          </button>
+                          <p className="text-right text-[11px] text-blue-100/80 tabular-nums">
+                            {formatShortDateTime(msg.createdAt)}
+                          </p>
+                        </div>
                       </div>
                     </div>
                   );
                 }
 
                 if (msg.role === 'error') {
+                  const { message: formattedError, isOverloaded } = formatGeminiErrorDisplay(
+                    msg.text,
+                    msg.errorCode
+                  );
+                  const retryPayload =
+                    msg.retryPayload ?? findPrecedingUserPayload(messages, idx);
+
                   return (
                     <div key={msg.id} className="flex justify-start">
-                      <div className="max-w-[92%] rounded-2xl rounded-bl-md border border-red-500/30 bg-[#1E1E1E] p-3.5 sm:max-w-[82%]">
+                      <div className="max-w-[94%] rounded-2xl rounded-bl-md border border-red-500/30 bg-[#1E1E1E] p-3.5 sm:max-w-[82%]">
                         <p className="text-xs font-semibold text-red-400">
                           Не удалось сгенерировать задачу
                         </p>
-                        <p className="mt-1 text-sm text-zinc-300 break-words">{msg.text}</p>
+                        <p className="mt-1 text-sm leading-relaxed text-zinc-300 break-words">
+                          {formattedError}
+                        </p>
+
+                        {retryPayload ? (
+                          <div className="mt-3 flex flex-wrap gap-2 border-t border-white/[0.06] pt-3">
+                            <button
+                              type="button"
+                              disabled={isGenerating}
+                              onClick={() =>
+                                void onRetryRequest({
+                                  payload: retryPayload,
+                                  errorMessageId: msg.id,
+                                })
+                              }
+                              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-[#3B82F6] px-4 text-xs font-semibold text-white transition-transform hover:bg-blue-500 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                              <RotateCw className="h-3.5 w-3.5" />
+                              <span>Повторить запрос</span>
+                            </button>
+
+                            {isOverloaded && geminiModel !== 'gemini-3.1-flash-lite' ? (
+                              <button
+                                type="button"
+                                disabled={isGenerating}
+                                onClick={() =>
+                                  void onRetryRequest({
+                                    payload: retryPayload,
+                                    errorMessageId: msg.id,
+                                    modelOverride: 'gemini-3.1-flash-lite',
+                                  })
+                                }
+                                className="inline-flex min-h-[44px] items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-white/5 px-3.5 text-xs font-medium text-zinc-200 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <span>Через Flash Lite</span>
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   );
@@ -298,6 +412,10 @@ export function ChatScreen({
 
                 const task = msg.generatedTask;
                 const pMeta = task ? PRIORITY_META[task.priority] : null;
+                const modelMeta = task?.model ? getGeminiModelOption(task.model) : null;
+                const levelMeta = task?.thinkingLevel
+                  ? THINKING_LEVEL_META[task.thinkingLevel]
+                  : null;
 
                 return (
                   <div key={msg.id} className="flex justify-start">
@@ -311,6 +429,15 @@ export function ChatScreen({
                               <span className={`font-medium ${pMeta.textColor}`}>
                                 Приоритет: {pMeta.label}
                               </span>
+                            ) : null}
+                            {modelMeta ? (
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span>
+                                  {modelMeta.shortLabel}
+                                  {levelMeta ? ` (${levelMeta.shortLabel})` : ''}
+                                </span>
+                              </>
                             ) : null}
                             <span aria-hidden="true">·</span>
                             <span className="tabular-nums">{formatShortDateTime(msg.createdAt)}</span>
@@ -351,7 +478,10 @@ export function ChatScreen({
             <div className="flex justify-start">
               <div className="flex items-center gap-2.5 rounded-2xl rounded-bl-md border border-white/[0.08] bg-[#1E1E1E] px-4 py-3 text-sm text-zinc-300">
                 <Loader2 className="h-4 w-4 animate-spin text-[#3B82F6]" />
-                <span>Анализирую скриншот и формирую задачу...</span>
+                <span>
+                  Анализирую скриншот ({activeModelOption.shortLabel},{' '}
+                  {THINKING_LEVEL_META[thinkingLevel].shortLabel.toLowerCase()})...
+                </span>
               </div>
             </div>
           ) : null}
@@ -361,10 +491,48 @@ export function ChatScreen({
       </div>
 
       {/* Bottom Composer */}
-      <div className="shrink-0 border-t border-white/[0.08] bg-[#161618] px-3 py-2.5">
-        <div className="mx-auto max-w-3xl">
+      <div className="shrink-0 border-t border-white/[0.08] bg-[#161618] px-3 py-2">
+        <div className="mx-auto max-w-3xl space-y-2">
+          {/* Compact Model & Reasoning Level Selectors */}
+          <div className="grid grid-cols-2 gap-2">
+            <select
+              aria-label="Модель Gemini"
+              disabled={isGenerating}
+              value={geminiModel}
+              onChange={(e) => {
+                const nextModel = e.target.value as GeminiModelId;
+                const nextLevel = normalizeThinkingLevelForModel(nextModel, thinkingLevel);
+                onChangeGeminiConfig(nextModel, nextLevel);
+              }}
+              className="min-h-[40px] w-full truncate rounded-xl border border-white/[0.08] bg-[#1E1E1E] px-2.5 text-xs font-medium text-zinc-200 focus:border-[#3B82F6] focus:outline-none disabled:opacity-60"
+            >
+              {GEMINI_MODELS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+
+            <select
+              aria-label="Уровень рассуждений"
+              disabled={isGenerating}
+              value={thinkingLevel}
+              onChange={(e) => {
+                const nextLevel = e.target.value as GeminiThinkingLevel;
+                onChangeGeminiConfig(geminiModel, nextLevel);
+              }}
+              className="min-h-[40px] w-full truncate rounded-xl border border-white/[0.08] bg-[#1E1E1E] px-2.5 text-xs font-medium text-zinc-200 focus:border-[#3B82F6] focus:outline-none disabled:opacity-60"
+            >
+              {activeModelOption.supportedThinkingLevels.map((lvl) => (
+                <option key={lvl} value={lvl}>
+                  Рассуждения: {THINKING_LEVEL_META[lvl].shortLabel}
+                </option>
+              ))}
+            </select>
+          </div>
+
           {pendingImage ? (
-            <div className="mb-2 flex items-center gap-3 rounded-xl border border-white/[0.08] bg-[#1E1E1E] p-2">
+            <div className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-[#1E1E1E] p-2">
               <button
                 type="button"
                 onClick={() => onZoomImage(pendingImage.dataUrl, pendingImage.fileName)}
@@ -427,7 +595,7 @@ export function ChatScreen({
               }}
               onPaste={handleTextareaPaste}
               onKeyDown={handleKeyDown}
-              placeholder="Опишите баг (или вставьте скриншот Ctrl+V)..."
+              placeholder="Опишите баг или вставьте скриншот..."
               className="min-h-[44px] max-h-32 flex-1 resize-none rounded-xl border border-white/[0.08] bg-[#1E1E1E] px-3.5 py-2.5 text-sm leading-5 text-white placeholder:text-zinc-500 focus:border-[#3B82F6] focus:outline-none"
             />
 

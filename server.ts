@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
@@ -30,6 +30,124 @@ const QA_SYSTEM_INSTRUCTION = `Ты — ассистент QA-инженера. 
 - "title": заголовок задачи в формате "[Раздел / Подраздел]: [Краткая суть проблемы или улучшения]"
 - "descr": подробное описание в Markdown (1-2 абзаца строго по фактам с экрана и словам автора, плюс блок "Предлагаю:" с вариантом решения, если уместно). Никаких домыслов и придуманных технических причин, если автор о них не написал. Если баг связан с правами доступа или безопасностью, добавь [Security] в начало title.
 - "priority": одно из значений ("low", "normal", "high", "urgent").`;
+
+const ALLOWED_GEMINI_MODELS = new Set([
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
+]);
+
+type RequestedThinkingLevel = 'AUTO' | 'MINIMAL' | 'LOW' | 'MEDIUM' | 'HIGH' | 'XHIGH';
+
+function resolveGeminiModel(rawModel: unknown): 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' {
+  if (typeof rawModel === 'string' && ALLOWED_GEMINI_MODELS.has(rawModel)) {
+    return rawModel as 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
+  }
+  return 'gemini-4-hydrogen';
+}
+
+function resolveThinkingLevel(
+  model: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite',
+  rawLevel: unknown
+): { sdkLevel?: ThinkingLevel; effectiveLabel: RequestedThinkingLevel } {
+  const valid = new Set<RequestedThinkingLevel>([
+    'AUTO',
+    'MINIMAL',
+    'LOW',
+    'MEDIUM',
+    'HIGH',
+    'XHIGH',
+  ]);
+  const requested: RequestedThinkingLevel =
+    typeof rawLevel === 'string' && valid.has(rawLevel.toUpperCase() as RequestedThinkingLevel)
+      ? (rawLevel.toUpperCase() as RequestedThinkingLevel)
+      : 'AUTO';
+
+  if (requested === 'AUTO') {
+    return { sdkLevel: undefined, effectiveLabel: 'AUTO' };
+  }
+
+  if (model === 'gemini-4-hydrogen') {
+    if (requested === 'MINIMAL' || requested === 'LOW') {
+      return { sdkLevel: ThinkingLevel.LOW, effectiveLabel: 'LOW' };
+    }
+    if (requested === 'MEDIUM') {
+      return { sdkLevel: ThinkingLevel.MEDIUM, effectiveLabel: 'MEDIUM' };
+    }
+    if (requested === 'XHIGH') {
+      return { sdkLevel: ThinkingLevel.XHIGH, effectiveLabel: 'XHIGH' };
+    }
+    return { sdkLevel: ThinkingLevel.HIGH, effectiveLabel: 'HIGH' };
+  }
+
+  // gemini-3.1-flash-lite supports MINIMAL, LOW, MEDIUM, HIGH (not XHIGH)
+  if (requested === 'MINIMAL') {
+    return { sdkLevel: ThinkingLevel.MINIMAL, effectiveLabel: 'MINIMAL' };
+  }
+  if (requested === 'LOW') {
+    return { sdkLevel: ThinkingLevel.LOW, effectiveLabel: 'LOW' };
+  }
+  if (requested === 'MEDIUM') {
+    return { sdkLevel: ThinkingLevel.MEDIUM, effectiveLabel: 'MEDIUM' };
+  }
+  return { sdkLevel: ThinkingLevel.HIGH, effectiveLabel: 'HIGH' };
+}
+
+function parseGeminiApiError(err: unknown): {
+  httpStatus: number;
+  apiStatus: string;
+  rawMessage: string;
+} {
+  const errObj = err && typeof err === 'object' ? (err as Record<string, unknown>) : null;
+  let httpStatus =
+    errObj && typeof errObj.status === 'number' && Number.isFinite(errObj.status)
+      ? errObj.status
+      : 500;
+  let rawMessage =
+    err instanceof Error ? err.message : 'Ошибка при обращении к Gemini API';
+  let apiStatus = '';
+
+  const jsonMatch = rawMessage.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as {
+        error?: { code?: number; message?: string; status?: string };
+      };
+      if (parsed.error) {
+        if (typeof parsed.error.code === 'number') httpStatus = parsed.error.code;
+        if (typeof parsed.error.status === 'string') apiStatus = parsed.error.status;
+        if (typeof parsed.error.message === 'string') rawMessage = parsed.error.message;
+      }
+    } catch {
+      // Keep original rawMessage
+    }
+  }
+
+  return { httpStatus, apiStatus, rawMessage };
+}
+
+function isTransientGeminiError(info: {
+  httpStatus: number;
+  apiStatus: string;
+  rawMessage: string;
+}): boolean {
+  const msgLower = info.rawMessage.toLowerCase();
+  return (
+    info.httpStatus === 503 ||
+    info.httpStatus === 429 ||
+    info.apiStatus === 'UNAVAILABLE' ||
+    info.apiStatus === 'RESOURCE_EXHAUSTED' ||
+    msgLower.includes('high demand') ||
+    msgLower.includes('overloaded') ||
+    msgLower.includes('unavailable') ||
+    msgLower.includes('econnreset') ||
+    msgLower.includes('etimedout') ||
+    msgLower.includes('fetch failed')
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -346,12 +464,18 @@ async function createApp() {
 
   // 1. Gemini Multimodal QA Bug Report Generation
   app.post('/api/gemini/analyze', async (req: Request, res: Response) => {
+    let selectedModel: 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite' = 'gemini-4-hydrogen';
     try {
-      const { imageBase64, mimeType, comment } = req.body as {
+      const { imageBase64, mimeType, comment, model, thinkingLevel } = req.body as {
         imageBase64?: string;
         mimeType?: string;
         comment?: string;
+        model?: string;
+        thinkingLevel?: string;
       };
+
+      selectedModel = resolveGeminiModel(model);
+      const { sdkLevel, effectiveLabel } = resolveThinkingLevel(selectedModel, thinkingLevel);
 
       const cleanComment = typeof comment === 'string' ? comment.trim() : '';
       const hasImage = typeof imageBase64 === 'string' && imageBase64.length > 0;
@@ -392,41 +516,66 @@ async function createApp() {
       });
 
       const ai = getGeminiClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: { parts },
-        config: {
-          systemInstruction: QA_SYSTEM_INSTRUCTION,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: {
-                type: Type.STRING,
-                description:
-                  'Заголовок задачи в формате "[Раздел / Подраздел]: [Краткая суть]". Добавь [Security] в начало, если связано с правами доступа или безопасностью.',
-              },
-              descr: {
-                type: Type.STRING,
-                description:
-                  'Подробное описание в Markdown (1-2 абзаца по фактам + блок "Предлагаю:" если уместно).',
-              },
-              priority: {
-                type: Type.STRING,
-                description: 'Приоритет задачи: low, normal, high или urgent.',
-                enum: ['low', 'normal', 'high', 'urgent'],
-              },
+      const requestConfig = {
+        systemInstruction: QA_SYSTEM_INSTRUCTION,
+        responseMimeType: 'application/json',
+        ...(sdkLevel ? { thinkingConfig: { thinkingLevel: sdkLevel } } : {}),
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: {
+              type: Type.STRING,
+              description:
+                'Заголовок задачи в формате "[Раздел / Подраздел]: [Краткая суть]". Добавь [Security] в начало, если связано с правами доступа или безопасностью.',
             },
-            required: ['title', 'descr', 'priority'],
+            descr: {
+              type: Type.STRING,
+              description:
+                'Подробное описание в Markdown (1-2 абзаца по фактам + блок "Предлагаю:" если уместно).',
+            },
+            priority: {
+              type: Type.STRING,
+              description: 'Приоритет задачи: low, normal, high или urgent.',
+              enum: ['low', 'normal', 'high', 'urgent'],
+            },
           },
+          required: ['title', 'descr', 'priority'],
         },
-      });
+      };
+
+      const MAX_ATTEMPTS = 3;
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+      let lastErr: unknown = null;
+
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+        try {
+          response = await ai.models.generateContent({
+            model: selectedModel,
+            contents: { parts },
+            config: requestConfig,
+          });
+          break;
+        } catch (err) {
+          lastErr = err;
+          const info = parseGeminiApiError(err);
+          const shouldRetry = attempt < MAX_ATTEMPTS - 1 && isTransientGeminiError(info);
+          if (!shouldRetry) {
+            throw err;
+          }
+          const backoffMs = 900 * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
+          await sleep(backoffMs);
+        }
+      }
+
+      if (!response) {
+        throw lastErr ?? new Error('Не удалось получить ответ от Gemini API');
+      }
 
       const rawText = (response.text ?? '').trim();
       if (!rawText) {
         res.status(502).json({
           error: 'empty_model_response',
-          message: 'Gemini вернул пустой ответ. Попробуйте повторить запрос.',
+          message: 'Gemini вернул пустой ответ. Нажмите «Повторить запрос».',
         });
         return;
       }
@@ -452,25 +601,62 @@ async function createApp() {
         title: String(parsed.title || '[UI]: Проблема на скриншоте').slice(0, 500),
         descr: String(parsed.descr || cleanComment || ''),
         priority,
+        modelUsed: selectedModel,
+        thinkingLevelUsed: effectiveLabel,
       });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Ошибка при обращении к Gemini API';
-      if (message === 'GEMINI_API_KEY_MISSING') {
+      if (err instanceof Error && err.message === 'GEMINI_API_KEY_MISSING') {
         res.status(500).json({
           error: 'gemini_key_missing',
           message: 'На сервере не задан GEMINI_API_KEY. Добавьте ключ в Settings > Secrets.',
         });
         return;
       }
-      const status =
-        message.includes('PERMISSION_DENIED') || message.includes('403')
-          ? 403
-          : message.includes('RESOURCE_EXHAUSTED') || message.includes('429')
-            ? 429
-            : 500;
+
+      const { httpStatus, apiStatus, rawMessage } = parseGeminiApiError(err);
+
+      if (
+        httpStatus === 503 ||
+        apiStatus === 'UNAVAILABLE' ||
+        rawMessage.toLowerCase().includes('high demand')
+      ) {
+        const modelTitle =
+          selectedModel === 'gemini-3.1-flash-lite' ? 'Gemini 3.1 Flash Lite' : 'Gemini 4 Hydrogen';
+        res.status(503).json({
+          error: 'model_overloaded',
+          message: `Модель ${modelTitle} временно перегружена (503). Повторите запрос или переключитесь на другую модель.`,
+        });
+        return;
+      }
+
+      if (httpStatus === 429 || apiStatus === 'RESOURCE_EXHAUSTED') {
+        res.status(429).json({
+          error: 'rate_limited',
+          message: 'Превышен лимит запросов к Gemini API (429). Подождите немного и повторите запрос.',
+        });
+        return;
+      }
+
+      if (httpStatus === 403 || apiStatus === 'PERMISSION_DENIED') {
+        res.status(403).json({
+          error: 'permission_denied',
+          message: 'Доступ к Gemini API отклонён (403). Проверьте GEMINI_API_KEY в Settings > Secrets.',
+        });
+        return;
+      }
+
+      if (httpStatus === 404 || apiStatus === 'NOT_FOUND') {
+        res.status(404).json({
+          error: 'model_not_found',
+          message: `Модель ${selectedModel} временно недоступна (404). Попробуйте выбрать другую модель.`,
+        });
+        return;
+      }
+
+      const status = httpStatus >= 400 && httpStatus < 600 ? httpStatus : 500;
       res.status(status).json({
         error: 'gemini_error',
-        message,
+        message: rawMessage,
       });
     }
   });

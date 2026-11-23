@@ -4,6 +4,23 @@ export type TaskStatus = 'draft' | 'sent';
 
 export type ActiveTab = 'chat' | 'tasks' | 'settings';
 
+export type GeminiModelId = 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
+
+export type GeminiThinkingLevel =
+  | 'AUTO'
+  | 'MINIMAL'
+  | 'LOW'
+  | 'MEDIUM'
+  | 'HIGH'
+  | 'XHIGH';
+
+export interface RetryAnalyzePayload {
+  imageDataUrl?: string;
+  imageMimeType?: string;
+  imageName?: string;
+  comment: string;
+}
+
 export interface TaskDraft {
   id: string;
   requestId: string;
@@ -32,12 +49,17 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'error';
   text: string;
   imageDataUrl?: string;
+  imageMimeType?: string;
   imageName?: string;
   taskId?: string;
+  errorCode?: string;
+  retryPayload?: RetryAnalyzePayload;
   generatedTask?: {
     title: string;
     descr: string;
     priority: Priority;
+    model?: GeminiModelId;
+    thinkingLevel?: GeminiThinkingLevel;
   };
   createdAt: number;
 }
@@ -70,6 +92,8 @@ export interface AppSettings {
   defaultBoardId: number | null;
   defaultStageId: number | null;
   defaultAssigneeId: number | null;
+  geminiModel: GeminiModelId;
+  thinkingLevel: GeminiThinkingLevel;
 }
 
 export interface TrackerCache {

@@ -108,6 +108,18 @@ export async function saveMessage(msg: ChatMessage): Promise<void> {
   }
 }
 
+export async function deleteMessageById(id: string): Promise<void> {
+  try {
+    await withStore(MESSAGES_STORE, 'readwrite', (s) => s.delete(id));
+  } catch {
+    const existing = await getAllMessages();
+    localStorage.setItem(
+      FALLBACK_MESSAGES_KEY,
+      JSON.stringify(existing.filter((m) => m.id !== id))
+    );
+  }
+}
+
 export async function clearAllMessages(): Promise<void> {
   try {
     await withStore(MESSAGES_STORE, 'readwrite', (s) => s.clear());
